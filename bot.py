@@ -1,170 +1,140 @@
 import os
-import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import MongoClient
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "dedpost")
+TOKEN = os.getenv("DISCORD_TOKEN")
+MONGO = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME")
 
 intents = discord.Intents.default()
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-mongo = AsyncIOMotorClient(MONGO_URI)
+mongo = MongoClient(MONGO)
 db = mongo[DB_NAME]
-settings_db = db.settings
+accounts = db["accounts"]
 
-
-# -----------------------------
-# HELPERS
-# -----------------------------
-async def get_settings(guild_id: int):
-    data = await settings_db.find_one({"guild_id": guild_id})
-    if not data:
-        default = {
-            "guild_id": guild_id,
-            "token": None,
-            "message": None,
-            "channel_id": None,
-            "delay": 10,
-            "webhook": None,
-            "active": False
-        }
-        await settings_db.insert_one(default)
-        return default
-    return data
-
-
-# -----------------------------
-# MODAL FORM PREMIUM
-# -----------------------------
-class AccountModal(discord.ui.Modal, title="✨ Account Management (Premium)"):
-    token = discord.ui.TextInput(
-        label="🔑 Token",
-        placeholder="Masukkan token Anda...",
-        required=True
-    )
-    message = discord.ui.TextInput(
-        label="💬 Message",
-        placeholder="Tulis message untuk autopost...",
-        style=discord.TextStyle.long,
-        required=True,
-        max_length=3900
-    )
-    channel = discord.ui.TextInput(
-        label="📺 Channel ID",
-        placeholder="Contoh: 123456789012345678",
-        required=True
-    )
-    delay = discord.ui.TextInput(
-        label="⏱ Delay (Minutes)",
-        placeholder="Contoh: 10",
-        required=True
-    )
-    webhook = discord.ui.TextInput(
-        label="🔗 Webhook URL (Optional)",
-        placeholder="Isi jika pakai webhook",
-        required=False
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild_id = interaction.guild.id
-        await settings_db.update_one(
-            {"guild_id": guild_id},
-            {"$set": {
-                "token": self.token.value,
-                "message": self.message.value,
-                "channel_id": self.channel.value,
-                "delay": int(self.delay.value),
-                "webhook": self.webhook.value
-            }},
-            upsert=True
-        )
-        await interaction.response.send_message("✅ **Settings updated successfully!**", ephemeral=True)
-
-
-# -----------------------------
-# BUTTON UI
-# -----------------------------
-class PanelButtons(discord.ui.View):
+# ================================
+# BUTTONS + PANEL (MIX STYLE)
+# ================================
+class PanelButton(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔧 Manage Account", style=discord.ButtonStyle.blurple)
-    async def manage(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AccountModal())
-
-    @discord.ui.button(label="📊 Account Info", style=discord.ButtonStyle.gray)
-    async def info(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = await get_settings(interaction.guild.id)
-
-        embed = discord.Embed(
-            title="📊 AUTOPOST ACCOUNT INFO",
-            color=0x3498db
-        )
-        embed.set_thumbnail(url="https://cdn.discordapp.com/embed/avatars/0.png")
-        embed.add_field(name="🔑 Token", value=f"```{data.get('token','None')}```", inline=False)
-        embed.add_field(name="💬 Message", value=f"```{data.get('message','None')}```", inline=False)
-        embed.add_field(name="📺 Channel ID", value=data.get("channel_id","None"), inline=False)
-        embed.add_field(name="⏱ Delay", value=f"{data.get('delay')} minutes", inline=False)
-        embed.add_field(name="🔗 Webhook", value=data.get("webhook","None"), inline=False)
-        embed.add_field(name="🚀 Status", value="Active ✅" if data.get("active") else "Inactive ❌", inline=False)
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(label="🚀 Start / Stop Autopost", style=discord.ButtonStyle.green)
-    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = await get_settings(interaction.guild.id)
-        new_state = not data.get("active")
-        await settings_db.update_one(
-            {"guild_id": interaction.guild.id},
-            {"$set": {"active": new_state}}
-        )
+    @discord.ui.button(label="⚙ Settings", style=discord.ButtonStyle.primary)
+    async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            f"🚀 Autopost set to: **{new_state}**",
+            embed=discord.Embed(
+                title="⚙ Settings Panel",
+                description="Isi data autopost kamu di bawah ini.",
+                color=discord.Color.blue(),
+            ),
+            view=SettingsForm(),
             ephemeral=True
         )
 
-    @discord.ui.button(label="🌐 Create Webhook", style=discord.ButtonStyle.grey)
-    async def create_webhook(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel = interaction.channel
-        webhook = await channel.create_webhook(name="DedAutoPost Webhook")
-        await settings_db.update_one({"guild_id": interaction.guild.id}, {"$set": {"webhook": webhook.url}})
-        await interaction.response.send_message(f"🔗 Webhook created:\n{webhook.url}", ephemeral=True)
+    @discord.ui.button(label="👤 Account Manager", style=discord.ButtonStyle.secondary)
+    async def account(self, interaction: discord.Interaction, button: discord.ui.Button):
+        doc = accounts.find_one({"user_id": interaction.user.id})
+
+        if not doc:
+            return await interaction.response.send_message("Belum ada akun diset!", ephemeral=True)
+
+        embed = discord.Embed(
+            title="👤 Account Info",
+            description=f"**Token:** {doc['token'][:20]}****\n"
+                        f"**Delay:** {doc['delay']} detik\n"
+                        f"**Channel:** {doc['channel_id']}\n"
+                        f"**Message:** {doc['message']}\n"
+                        f"**Webhook:** {doc.get('webhook', '-')}",
+            color=discord.Color.green(),
+        )
+        embed.set_thumbnail(url="https://i.imgur.com/MQszDqP.png")  # thumbnail premium
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🚀 Start", style=discord.ButtonStyle.success)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        accounts.update_one(
+            {"user_id": interaction.user.id},
+            {"$set": {"active": True}},
+            upsert=True
+        )
+
+        await interaction.response.send_message("Autopost **diaktifkan** ✔", ephemeral=True)
+
+    @discord.ui.button(label="🛑 Stop", style=discord.ButtonStyle.danger)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        accounts.update_one(
+            {"user_id": interaction.user.id},
+            {"$set": {"active": False}},
+            upsert=True
+        )
+
+        await interaction.response.send_message("Autopost **dimatikan** ❌", ephemeral=True)
 
 
+# =============================
+# SETTINGS FORM (INPUT DATA)
+# =============================
+class SettingsForm(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-# -----------------------------
-# PANEL COMMAND
-# -----------------------------
-@bot.tree.command(name="panel", description="Open the Autopost Control Panel")
+        self.token = discord.ui.TextInput(label="Token User")
+        self.message = discord.ui.TextInput(label="Message Autopost", style=discord.TextStyle.long)
+        self.delay = discord.ui.TextInput(label="Delay (detik)")
+        self.channel = discord.ui.TextInput(label="Channel ID")
+        self.webhook = discord.ui.TextInput(label="Webhook URL (optional)")
+
+        self.add_item(self.token)
+        self.add_item(self.message)
+        self.add_item(self.delay)
+        self.add_item(self.channel)
+        self.add_item(self.webhook)
+
+    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        accounts.update_one(
+            {"user_id": interaction.user.id},
+            {
+                "$set": {
+                    "token": self.token.value,
+                    "message": self.message.value,
+                    "delay": int(self.delay.value),
+                    "channel_id": int(self.channel.value),
+                    "webhook": self.webhook.value,
+                    "active": False
+                }
+            },
+            upsert=True
+        )
+
+        await interaction.response.send_message("Data berhasil disimpan ✔", ephemeral=True)
+
+
+# =============================
+# SLASH COMMAND: /panel
+# =============================
+@bot.tree.command(name="panel", description="Buka panel autopost premium")
 async def panel(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="💎 PREMIUM AUTOPOST PANEL",
-        description="Manage your autopost settings using the buttons below.",
-        color=0x5dade2
+        title="🚀 DedPost Premium Panel",
+        description="Gunakan tombol di bawah untuk mengatur autopost kamu.",
+        color=discord.Color.blurple()
     )
-    embed.set_thumbnail(url="https://cdn.discordapp.com/embed/avatars/1.png")
+    embed.set_thumbnail(url="https://i.imgur.com/5fX8G0S.png")  # premium top-right
 
-    await interaction.response.send_message(embed=embed, view=PanelButtons(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=PanelButton(), ephemeral=True)
 
 
-# -----------------------------
-# READY EVENT
-# -----------------------------
 @bot.event
 async def on_ready():
-    print(f"Bot connected as {bot.user}")
-    try:
-        synced = await bot.tree.sync()
-        print("Commands synced:", len(synced))
-    except Exception as e:
-        print("ERROR:", e)
+    await bot.tree.sync()
+    print("Command synced!")
+    print(f"Logged in as {bot.user}")
 
-
-# -----------------------------
-# RUN BOT
-# -----------------------------
-bot.run(DISCORD_TOKEN)
+bot.run(TOKEN)
